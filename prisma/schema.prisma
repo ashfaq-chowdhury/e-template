@@ -1,0 +1,153 @@
+// ============================================================================
+// e-template — Relational PostgreSQL Schema (Prisma ORM)
+// ============================================================================
+// Key architectural patterns demonstrated here:
+// 1. Unified Checkout -> Split Fulfillment: A single `Payment` staging record
+//    captures a mixed cart (merch + tickets) before redirecting to SSLCommerz,
+//    then splits into `Order` (physical merch) and `TicketOrder` (event seats).
+// 2. Referential Integrity:
+//    - `onDelete: Cascade`: Deleting a parent (`Order` -> `OrderItem`,
+//      `Event` -> `TicketType`, `User` -> `Order`) cleans up child records.
+//    - `onDelete: Restrict`: Blocks deleting a `Product` or `TicketType` if
+//      customers have already ordered it, preserving financial/order history.
+// 3. Idempotency via `@unique` `transactionId`: Prevents duplicate order
+//    creation if payment verification or IPN webhooks fire more than once.
+//    Mixed carts derive suffixed IDs (`TXN-...-MERCH`, `TXN-...-TKT0`) so
+//    every domain table enforces uniqueness without colliding.
+// ============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id           String        @id @default(cuid())
+  email        String        @unique
+  password     String        // Stored strictly as a salted bcrypt hash
+  name         String
+  phone        String?
+  isAdmin      Boolean       @default(false) // RBAC flag checked by API guards
+  orders       Order[]
+  ticketOrders TicketOrder[]
+  createdAt    DateTime      @default(now())
+  updatedAt    DateTime      @updatedAt
+}
+
+model Product {
+  id          String      @id @default(cuid())
+  name        String
+  description String?
+  price       Float
+  category    String
+  stock       Int         @default(0)
+  imageUrl    String?     // Public CDN URL returned by Supabase Storage
+  sku         String?     @unique
+  orderItems  OrderItem[]
+  createdAt   DateTime    @default(now())
+  updatedAt   DateTime    @updatedAt
+}
+
+model Event {
+  id           String        @id @default(cuid())
+  title        String
+  description  String?
+  dateTime     DateTime
+  location     String?
+  capacity     Int?
+  ticketTypes  TicketType[]
+  ticketOrders TicketOrder[]
+  createdAt    DateTime      @default(now())
+  updatedAt    DateTime      @updatedAt
+}
+
+model TicketType {
+  id           String        @id @default(cuid())
+  eventId      String
+  // Cascade: removing an Event removes its unpurchased TicketTypes
+  event        Event         @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  name         String        // e.g. "VIP", "General"
+  price        Float
+  quantity     Int           @default(0)
+  sold         Int           @default(0)
+  ticketOrders TicketOrder[]
+  createdAt    DateTime      @default(now())
+  updatedAt    DateTime      @updatedAt
+}
+
+model Order {
+  id             String      @id @default(cuid())
+  userId         String
+  user           User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  orderNumber    String      @unique
+  status         String      @default("pending")   // pending | completed | cancelled
+  totalAmount    Float
+  paymentMethod  String      // e.g. "sslcommerz"
+  paymentStatus  String      @default("pending")   // pending | completed | failed
+  transactionId  String?     @unique // Unique per merch order (`TXN-...-MERCH` if mixed)
+  phone          String
+  email          String
+  merchFulfilled Boolean     @default(false)       // Toggled by Admin upon shipping/handover
+  items          OrderItem[]
+  createdAt      DateTime    @default(now())
+  updatedAt      DateTime    @updatedAt
+}
+
+model OrderItem {
+  id        String   @id @default(cuid())
+  orderId   String
+  // Cascade: deleting an Order deletes its line items
+  order     Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  productId String
+  // Restrict: cannot delete a Product referenced by historical customer orders
+  product   Product  @relation(fields: [productId], references: [id], onDelete: Restrict)
+  quantity  Int
+  price     Float    // Price snapshot at checkout time (immune to future price edits)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model TicketOrder {
+  id            String     @id @default(cuid())
+  userId        String
+  user          User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  orderNumber   String     @unique
+  eventId       String
+  event         Event      @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  ticketTypeId  String
+  // Restrict: prevents deleting a TicketType after tickets have been sold
+  ticketType    TicketType @relation(fields: [ticketTypeId], references: [id], onDelete: Restrict)
+  quantity      Int
+  unitPrice     Float      // Price snapshot at checkout time
+  totalAmount   Float
+  paymentMethod String
+  paymentStatus String     @default("pending")
+  transactionId String?    @unique // Unique per ticket line (`TXN-...-TKT0`, `-TKT1`, ...)
+  status        String     @default("confirmed") // confirmed | used | cancelled
+  seatNumber    String?    // Assigned by Admin in /admin dashboard (e.g. "A-12")
+  createdAt     DateTime   @default(now())
+  updatedAt     DateTime   @updatedAt
+}
+
+model Payment {
+  id            String   @id @default(cuid())
+  transactionId String   @unique // Parent gateway transaction ID (`TXN-...`)
+  userId        String
+  totalAmount   Float
+  paymentMethod String
+  // Staging payload: serialized cart (both merch & tickets) saved BEFORE redirecting
+  // to SSLCommerz so server-side verification can reconstruct and split orders securely.
+  cartItems     String
+  userEmail     String
+  userName      String
+  userPhone     String
+  paymentStatus String   @default("pending") // pending | completed | failed
+  expiresAt     DateTime // TTL for cleaning up abandoned checkout sessions
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+}
+
